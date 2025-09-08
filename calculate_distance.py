@@ -119,3 +119,20 @@ def numeric_distance(u, v, w_rooms=0.2, w_mates=0.3, w_budget=0.35, w_months=0.1
 def combo_score(D, alpha=4.0):
     """Convert a distance to a similarity score in (0, 1] via exp decay."""
     return exp(-alpha * D)  # higher is better
+
+if __name__ == "__main__":
+    user_a = {
+        'rooms': 1,
+        'roommates': 1,
+        'budget': 100000,
+        'months': 12
+    }
+    user_b = {
+        'rooms': 2,
+        'roommates': 2,
+        'budget': 150000,
+        'months': 6
+    }
+    distance = numeric_distance(user_a, user_b)
+    score = combo_score(distance)
+    print(f"Distance: {distance}, Score: {score}")  
