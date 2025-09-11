@@ -17,16 +17,16 @@ def _clamp(value, min_value, max_value):
     return value
 
 
-def normalize_rooms(x):
-    """Normalize desired rooms to [0, 1] by capping at 2 rooms and dividing by 2."""
-    x = _clamp(x, 0, 2)
-    return x / 2.0
+def normalize_rooms(x, cap=10):
+    """Normalize desired rooms to [0, 1] by capping at cap and dividing by cap."""
+    x = _clamp(x, 0, cap)
+    return x / cap
 
-
-def normalize_roommates(x):
-    """Normalize desired roommates to [0, 1] by capping at 2 and dividing by 2."""
-    x = _clamp(x, 0, 2)
-    return x / 2.0
+    
+def normalize_roommates(x, cap=10):
+    """Normalize desired roommates to [0, 1] by capping at cap and dividing by cap."""
+    x = _clamp(x, 0, cap)
+    return x / cap
 
 
 def normalize_budget(x, cap=200000):
@@ -51,8 +51,8 @@ available_parameters = {
 
 #? Do we need weights?
 parameter_weights = {
-    'rooms': 0.2,
-    'roommates': 0.3,
+    'rooms': 1,
+    'roommates': 1,
     'budget': 0.35,
     'months': 0.15
 }
