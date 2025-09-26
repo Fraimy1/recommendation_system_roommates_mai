@@ -1,9 +1,9 @@
 """
-Create normalized user preference vectors and compare them with cosine distance.
+Create normalized preference vectors for users and groups and compare them with cosine distance.
 
 - Normalizes each parameter to [0, 1] using simple, capped transforms
   consistent with prior distance capping (rooms/roommates cap at 2, months cap at 36).
-- Supports optional weighting of vector components.
+- Supports optional weighting of vector components for GROUPS.
 """
 from math import sqrt
 
@@ -49,8 +49,8 @@ available_parameters = {
     'months': normalize_months
 }
 
-#? Do we need weights?
-parameter_weights = {
+# Default weights applied to GROUP parameter vectors
+group_parameter_weights = {
     'rooms': 1,
     'roommates': 1,
     'budget': 0.35,
@@ -77,9 +77,15 @@ def create_user_vector(user:dict, parameters:list, caps:dict=None):
             vector.append(0.0)
     return vector
 
-def create_user_vector_with_weights(user:dict, parameters:list, weights:dict, caps:dict=None):
-    """Create a weighted normalized vector (elementwise normalized_value * weight)."""
-    base_vector = create_user_vector(user, parameters, caps)
+def create_group_vector_with_weights(values:dict, parameters:list, weights:dict, caps:dict=None):
+    """Create a weighted normalized vector for a GROUP using group parameter values.
+
+    values: mapping of parameter name to raw numeric value (e.g., averaged across members)
+    parameters: ordered list of parameter names
+    weights: group weights mapping
+    caps: optional caps for normalizers
+    """
+    base_vector = create_user_vector(values, parameters, caps)
     weighted_vector = []
     for i, param in enumerate(parameters):
         w = weights.get(param, 1.0)
@@ -100,14 +106,14 @@ def cosine_distance(vec1:list, vec2:list) -> float:
 
 
 if __name__ == "__main__":
-    # Example users represented as dicts
-    user_a = {
+    # Example values (as a single-member group)
+    group_a = {
         'rooms': 1,
         'roommates': 1,
         'budget': 10000,
         'months': 12
     }
-    user_b = {
+    group_b = {
         'rooms': 2,
         'roommates': 2,
         'budget': 15000,
@@ -115,24 +121,17 @@ if __name__ == "__main__":
     }
 
     parameters = ['rooms', 'roommates', 'budget', 'months']
-    weights = parameter_weights
+    weights = group_parameter_weights
 
     # Optional caps override (e.g., budget upper bound)
     caps = {'budget': 200000, 'months': 36}
 
-    vec_a = create_user_vector(user_a, parameters, caps)
-    vec_b = create_user_vector(user_b, parameters, caps)
+    vec_a = create_group_vector_with_weights(group_a, parameters, weights, caps)
+    vec_b = create_group_vector_with_weights(group_b, parameters, weights, caps)
 
-    wvec_a = create_user_vector_with_weights(user_a, parameters, weights, caps)
-    wvec_b = create_user_vector_with_weights(user_b, parameters, weights, caps)
+    dist_weighted = cosine_distance(vec_a, vec_b)
 
-    dist_unweighted = cosine_distance(vec_a, vec_b)
-    dist_weighted = cosine_distance(wvec_a, wvec_b)
-
-    print(f"User A vector (normalized): {vec_a}")
-    print(f"User B vector (normalized): {vec_b}")
-    print(f"Cosine distance (unweighted): {dist_unweighted}")
-    print(f"Cosine distance (weighted): {dist_weighted}")
-    
-    print(f"Similarity score (unweighted): {round((1 - dist_unweighted)*100, 2)}%")
-    print(f"Similarity score (weighted): {round((1 - dist_weighted)*100, 2)}%")
+    print(f"Group A weighted vector: {vec_a}")
+    print(f"Group B weighted vector: {vec_b}")
+    print(f"Cosine distance (group, weighted): {dist_weighted}")
+    print(f"Similarity score (group, weighted): {round((1 - dist_weighted)*100, 2)}%")

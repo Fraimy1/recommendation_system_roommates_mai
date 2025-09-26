@@ -4,8 +4,8 @@ from neo4j.exceptions import ServiceUnavailable, Neo4jError
 import os
 from create_user_vector import (
     create_user_vector,
-    create_user_vector_with_weights,
-    parameter_weights,
+    create_group_vector_with_weights,
+    group_parameter_weights,
     cosine_distance,
 )
 from manage_logging import (
@@ -30,7 +30,7 @@ def get_driver(uri=None, user=None, password=None):
     return GraphDatabase.driver(uri, auth=(user, password))
 
 def ensure_constraints_and_index(session, dims):
-    """Ensure required constraints and vector index exist for User nodes."""
+    """Ensure required constraints and vector indexes exist for User and Group nodes."""
     logger.debug(f"Setting up database constraints and indexes for {dims}-dimensional vectors")
     
     try:
@@ -51,6 +51,24 @@ def ensure_constraints_and_index(session, dims):
         log_neo4j_query(logger, param_constraint_query)
         session.run(param_constraint_query)
         logger.info("✓ Parameter uniqueness constraint ensured (userId, name)")
+
+        # Ensure a unique id constraint for Groups
+        group_constraint_query = """
+            CREATE CONSTRAINT group_id_unique IF NOT EXISTS
+            FOR (g:Group) REQUIRE g.id IS UNIQUE
+        """
+        log_neo4j_query(logger, group_constraint_query)
+        session.run(group_constraint_query)
+        logger.info("✓ Group ID uniqueness constraint ensured")
+
+        # Ensure a unique constraint for GroupParameter (groupId, name)
+        gparam_constraint_query = """
+            CREATE CONSTRAINT group_parameter_unique IF NOT EXISTS
+            FOR (p:GroupParameter) REQUIRE (p.groupId, p.name) IS UNIQUE
+        """
+        log_neo4j_query(logger, gparam_constraint_query)
+        session.run(gparam_constraint_query)
+        logger.info("✓ GroupParameter uniqueness constraint ensured (groupId, name)")
         
         # Check if vector index exists
         index_check_query = """
@@ -79,6 +97,33 @@ def ensure_constraints_and_index(session, dims):
         else:
             logger.info("✓ Vector index already exists")
             logger.debug("Skipping vector index creation - index already present")
+
+        # Check if GROUP vector index exists
+        gindex_check_query = """
+            SHOW INDEXES
+            YIELD name, type, entityType, labelsOrTypes, properties
+            WHERE type = 'VECTOR' AND entityType = 'NODE'
+              AND 'Group' IN labelsOrTypes AND 'embedding' IN properties
+            RETURN name LIMIT 1
+        """
+        log_neo4j_query(logger, gindex_check_query)
+        gresult = session.run(gindex_check_query)
+
+        if gresult.peek() is None:
+            gindex_create_query = """
+                CREATE VECTOR INDEX group_vec_index IF NOT EXISTS
+                FOR (g:Group) ON (g.embedding)
+                OPTIONS {indexConfig: {
+                    `vector.dimensions`: $dims,
+                    `vector.similarity_function`: 'cosine'
+                }}
+            """
+            log_neo4j_query(logger, gindex_create_query, {"dims": dims})
+            session.run(gindex_create_query, dims=dims)
+            logger.info(f"✓ Vector index 'group_vec_index' created with {dims} dimensions")
+        else:
+            logger.info("✓ Group vector index already exists")
+            logger.debug("Skipping group vector index creation - index already present")
             
     except Neo4jError as e:
         logger.warning(f"Could not ensure constraints/indexes: {e}")
@@ -86,71 +131,102 @@ def ensure_constraints_and_index(session, dims):
         # Continue execution - constraints might already exist
 
 def clear_users(session):
-    """Remove all User nodes and their Parameter nodes and relationships."""
+    """Remove all User, Group nodes and their Parameter nodes and relationships."""
     # Delete Parameter nodes attached to users first to avoid orphans
     clear_params_query = "MATCH (:User)-[:HAS_PARAMETER]->(p:Parameter) DETACH DELETE p"
     log_neo4j_query(logger, clear_params_query)
     session.run(clear_params_query)
+
+    # Delete GroupParameter nodes
+    clear_gparams_query = "MATCH (:Group)-[:HAS_PARAMETER]->(p:GroupParameter) DETACH DELETE p"
+    log_neo4j_query(logger, clear_gparams_query)
+    session.run(clear_gparams_query)
+
+    # Now delete groups
+    clear_groups_query = "MATCH (g:Group) DETACH DELETE g"
+    log_neo4j_query(logger, clear_groups_query)
+    session.run(clear_groups_query)
 
     # Now delete users
     clear_users_query = "MATCH (u:User) DETACH DELETE u"
     log_neo4j_query(logger, clear_users_query)
     session.run(clear_users_query)
 
-    logger.info("✓ All existing users and their parameters cleared from database")
-    logger.debug("Database cleanup completed - all User and Parameter nodes removed")
+    logger.info("✓ All existing users, groups, and their parameters cleared from database")
+    logger.debug("Database cleanup completed - all User, Group and Parameter nodes removed")
 
 def upsert_users(session, users, caps=None, use_weights=False, weights=None):
-    """Insert or update users with their preference vectors."""
-    weights = weights or parameter_weights
+    """Insert or update users along with their single-member groups and parameters."""
+    weights = weights or group_parameter_weights
     rows = []
     
     logger.debug(f"Processing {len(users)} users for database upsert")
     logger.debug(f"Using weights: {use_weights}, Vector caps: {caps}")
     
     for u in users:
-        vec = create_user_vector_with_weights(u, PARAMETERS, weights, caps) if use_weights \
-              else create_user_vector(u, PARAMETERS, caps)
-        
-        log_vector_operation(logger, "Created user vector", len(vec), u['id'])
-        
-        # Prepare parameter list as separate nodes
+        # Single-member group id and name
+        group_id = f"g_{u['id']}"
+        group_name = f"Group of {u.get('name') or u['id']}"
+
+        # Prepare parameter list as separate nodes (user and group)
         param_list = [{
             'name': p,
             'value': u.get(p)
         } for p in PARAMETERS]
 
+        group_values = {p: u.get(p) for p in PARAMETERS}
+        gvec = create_group_vector_with_weights(group_values, PARAMETERS, weights, caps) if use_weights \
+              else create_user_vector(group_values, PARAMETERS, caps)
+
+        log_vector_operation(logger, "Created group vector", len(gvec), group_id)
+
         rows.append({
-            'id': u['id'],
-            'name': u.get('name'),
-            'embedding': vec,
-            'parameters': param_list,
+            'user': {
+                'id': u['id'],
+                'name': u.get('name'),
+                'parameters': param_list,
+            },
+            'group': {
+                'id': group_id,
+                'name': group_name,
+                'embedding': gvec,
+                'parameters': param_list,
+            }
         })
     
     upsert_query = """
         UNWIND $rows AS row
-        MERGE (u:User {id: row.id})
-        SET u.name = row.name,
-            u.embedding = row.embedding
+        MERGE (u:User {id: row.user.id})
+        SET u.name = row.user.name
         WITH u, row
-        UNWIND row.parameters AS param
-        MERGE (p:Parameter {userId: row.id, name: param.name})
+        UNWIND row.user.parameters AS param
+        MERGE (p:Parameter {userId: row.user.id, name: param.name})
         SET p.value = param.value
         MERGE (u)-[:HAS_PARAMETER]->(p)
-        WITH DISTINCT u
-        RETURN count(u) as created
+        WITH u, row
+        MERGE (g:Group {id: row.group.id})
+        SET g.name = row.group.name,
+            g.embedding = row.group.embedding
+        MERGE (u)-[:MEMBER_OF]->(g)
+        WITH g, row
+        UNWIND row.group.parameters AS gparam
+        MERGE (gp:GroupParameter {groupId: row.group.id, name: gparam.name})
+        SET gp.value = gparam.value
+        MERGE (g)-[:HAS_PARAMETER]->(gp)
+        WITH DISTINCT g
+        RETURN count(g) as created
     """
     
     log_neo4j_query(logger, upsert_query, {"rows_count": len(rows)})
     result = session.run(upsert_query, rows=rows)
     
     count = result.single()['created']
-    logger.info(f"✓ {count} users upserted successfully")
+    logger.info(f"✓ {count} groups upserted successfully (and linked to users)")
     
-    log_database_stats(logger, {"nodes_created": count, "vectors_generated": len(rows)})
+    log_database_stats(logger, {"groups_created": count, "group_vectors_generated": len(rows)})
 
 def find_similar(session, vector, top_k=5, exclude_id=None):
-    """Find similar users using vector similarity search."""
+    """Find similar groups using vector similarity search."""
     log_vector_operation(logger, "Executing similarity search", len(vector), exclude_id)
     
     similarity_query = """
@@ -163,7 +239,7 @@ def find_similar(session, vector, top_k=5, exclude_id=None):
     """
     
     params = {
-        'indexName': 'user_vec_index', 
+        'indexName': 'group_vec_index', 
         'k': top_k, 
         'vector': vector, 
         'excludeId': exclude_id
@@ -179,41 +255,46 @@ def find_similar(session, vector, top_k=5, exclude_id=None):
     return results
 
 def find_similar_local(users, query_user, caps=None, use_weights=False, weights=None, top_k=5):
-    """Find similar users using local computation (fallback method)."""
-    weights = weights or parameter_weights
-    query_id = query_user.get('id')
+    """Find similar groups using local computation (fallback method)."""
+    weights = weights or group_parameter_weights
+    query_user_id = query_user.get('id')
+    query_group_id = f"g_{query_user_id}"
     
-    logger.debug(f"Computing local similarity for user {query_id} against {len(users)} users")
+    logger.debug(f"Computing local similarity for group {query_group_id} against {len(users)} groups")
     logger.debug(f"Using weights: {use_weights}, caps: {caps}")
     
+    group_values = {p: query_user.get(p) for p in PARAMETERS}
     if use_weights:
-        qvec = create_user_vector_with_weights(query_user, PARAMETERS, weights, caps)
+        qvec = create_group_vector_with_weights(group_values, PARAMETERS, weights, caps)
     else:
-        qvec = create_user_vector(query_user, PARAMETERS, caps)
+        qvec = create_user_vector(group_values, PARAMETERS, caps)
     
-    log_vector_operation(logger, "Generated query vector", len(qvec), query_id)
+    log_vector_operation(logger, "Generated group query vector", len(qvec), query_group_id)
     
     results = []
     for u in users:
-        if u['id'] == query_id:
+        uid = u['id']
+        gid = f"g_{uid}"
+        if gid == query_group_id:
             continue
             
+        values = {p: u.get(p) for p in PARAMETERS}
         if use_weights:
-            uvec = create_user_vector_with_weights(u, PARAMETERS, weights, caps)
+            uvec = create_group_vector_with_weights(values, PARAMETERS, weights, caps)
         else:
-            uvec = create_user_vector(u, PARAMETERS, caps)
+            uvec = create_user_vector(values, PARAMETERS, caps)
         
         # cosine_distance returns distance; convert to similarity
         distance = cosine_distance(qvec, uvec)
         sim = 1.0 - distance
         
-        logger.debug(f"Similarity between {query_id} and {u['id']}: {sim:.4f} (distance: {distance:.4f})")
-        results.append({'id': u['id'], 'name': u.get('name'), 'score': sim})
+        logger.debug(f"Similarity between {query_group_id} and {gid}: {sim:.4f} (distance: {distance:.4f})")
+        results.append({'id': gid, 'name': f"Group of {u.get('name') or uid}", 'score': sim})
     
     results.sort(key=lambda r: r['score'], reverse=True)
     final_results = results[:top_k]
     
-    log_similarity_results(logger, query_id, final_results, top_k)
+    log_similarity_results(logger, query_group_id, final_results, top_k)
     return final_results
 
 def clean_db():
@@ -324,9 +405,9 @@ def build_test_db_and_find_recommendations(
     
     Args:
         top_k (int): Number of recommendations per user. Use -1 for all available users.
-        use_weights (bool): Whether to use weighted vectors for similarity calculation.
+        use_weights (bool): Whether to use group weighted vectors for similarity calculation.
         caps (dict): Normalization caps for user properties. Default: {'budget': 200000, 'months': 36}
-        weights (dict): Weights for vector components. Default: parameter_weights from create_user_vector.
+        weights (dict): Group weights for vector components. Default: group_parameter_weights.
         clear_db_first (bool): Whether to clear existing users before inserting test data.
         test_users (list): Custom list of test users. Default: sample_users()
         verbose (bool): Whether to log detailed information about each user's recommendations.
@@ -336,7 +417,7 @@ def build_test_db_and_find_recommendations(
     """
     # Set defaults
     caps = caps or {'budget': 200000, 'months': 36}  # normalization caps
-    weights = weights or parameter_weights
+    weights = weights or group_parameter_weights
     users = test_users or sample_users()
     
     # Handle special case where top_k = -1 means "all users"
@@ -369,7 +450,7 @@ def build_test_db_and_find_recommendations(
                 all_results = {}
                 successful_queries = 0
                 
-                # Find recommendations for each user
+                # Find recommendations for each user's GROUP
                 for user in users:
                     if verbose:
                         logger.info(f"👤 {user['name']} (ID: {user['id']})")
@@ -378,14 +459,16 @@ def build_test_db_and_find_recommendations(
                     else:
                         logger.debug(f"Processing user {user['id']}: {user['name']}")
                     
-                    # Create query vector (use same weighting as database vectors)
+                    # Create group query vector (consistent with database vectors)
+                    group_values = {p: user.get(p) for p in PARAMETERS}
                     if use_weights:
-                        query_vec = create_user_vector_with_weights(user, PARAMETERS, weights, caps)
+                        query_vec = create_group_vector_with_weights(group_values, PARAMETERS, weights, caps)
                     else:
-                        query_vec = create_user_vector(user, PARAMETERS, caps)
+                        query_vec = create_user_vector(group_values, PARAMETERS, caps)
                     
-                    # Find similar users
-                    results = find_similar(session, query_vec, top_k=effective_top_k, exclude_id=user['id'])
+                    # Find similar groups (exclude this user's group)
+                    group_id = f"g_{user['id']}"
+                    results = find_similar(session, query_vec, top_k=effective_top_k, exclude_id=group_id)
                     all_results[user['id']] = results
                     
                     if results:
