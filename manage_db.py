@@ -43,6 +43,15 @@ def ensure_constraints_and_index(session, dims):
         session.run(constraint_query)
         logger.info("✓ User ID uniqueness constraint ensured")
         
+        # Ensure a unique constraint for Parameter nodes per (userId, name)
+        param_constraint_query = """
+            CREATE CONSTRAINT parameter_unique IF NOT EXISTS
+            FOR (p:Parameter) REQUIRE (p.userId, p.name) IS UNIQUE
+        """
+        log_neo4j_query(logger, param_constraint_query)
+        session.run(param_constraint_query)
+        logger.info("✓ Parameter uniqueness constraint ensured (userId, name)")
+        
         # Check if vector index exists
         index_check_query = """
             SHOW INDEXES
@@ -77,13 +86,19 @@ def ensure_constraints_and_index(session, dims):
         # Continue execution - constraints might already exist
 
 def clear_users(session):
-    """Remove all User nodes and their relationships."""
-    clear_query = "MATCH (u:User) DETACH DELETE u"
-    log_neo4j_query(logger, clear_query)
-    
-    result = session.run(clear_query)
-    logger.info("✓ All existing users cleared from database")
-    logger.debug("Database cleanup completed - all User nodes and relationships removed")
+    """Remove all User nodes and their Parameter nodes and relationships."""
+    # Delete Parameter nodes attached to users first to avoid orphans
+    clear_params_query = "MATCH (:User)-[:HAS_PARAMETER]->(p:Parameter) DETACH DELETE p"
+    log_neo4j_query(logger, clear_params_query)
+    session.run(clear_params_query)
+
+    # Now delete users
+    clear_users_query = "MATCH (u:User) DETACH DELETE u"
+    log_neo4j_query(logger, clear_users_query)
+    session.run(clear_users_query)
+
+    logger.info("✓ All existing users and their parameters cleared from database")
+    logger.debug("Database cleanup completed - all User and Parameter nodes removed")
 
 def upsert_users(session, users, caps=None, use_weights=False, weights=None):
     """Insert or update users with their preference vectors."""
@@ -99,25 +114,30 @@ def upsert_users(session, users, caps=None, use_weights=False, weights=None):
         
         log_vector_operation(logger, "Created user vector", len(vec), u['id'])
         
+        # Prepare parameter list as separate nodes
+        param_list = [{
+            'name': p,
+            'value': u.get(p)
+        } for p in PARAMETERS]
+
         rows.append({
             'id': u['id'],
             'name': u.get('name'),
-            'rooms': u.get('rooms'),
-            'roommates': u.get('roommates'),
-            'budget': u.get('budget'),
-            'months': u.get('months'),
             'embedding': vec,
+            'parameters': param_list,
         })
     
     upsert_query = """
         UNWIND $rows AS row
         MERGE (u:User {id: row.id})
         SET u.name = row.name,
-            u.rooms = row.rooms,
-            u.roommates = row.roommates,
-            u.budget = row.budget,
-            u.months = row.months,
             u.embedding = row.embedding
+        WITH u, row
+        UNWIND row.parameters AS param
+        MERGE (p:Parameter {userId: row.id, name: param.name})
+        SET p.value = param.value
+        MERGE (u)-[:HAS_PARAMETER]->(p)
+        WITH DISTINCT u
         RETURN count(u) as created
     """
     
